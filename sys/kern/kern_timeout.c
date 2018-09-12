@@ -80,6 +80,7 @@ SDT_PROVIDER_DEFINE(callout_execute);
 SDT_PROBE_DEFINE1(callout_execute, , , callout__start, "struct callout *");
 SDT_PROBE_DEFINE1(callout_execute, , , callout__end, "struct callout *");
 
+//TODO: what's going on here??
 #ifdef CALLOUT_PROFILING
 static int avg_depth;
 SYSCTL_INT(_debug, OID_AUTO, to_avg_depth, CTLFLAG_RD, &avg_depth, 0,
@@ -108,8 +109,10 @@ SYSCTL_INT(_debug, OID_AUTO, to_avg_mpcalls_dir, CTLFLAG_RD, &avg_mpcalls_dir,
 #endif
 
 static int ncallout;
+//TODO: WTF is SYSCTL_INT
 SYSCTL_INT(_kern, OID_AUTO, ncallout, CTLFLAG_RDTUN | CTLFLAG_NOFETCH, &ncallout, 0,
     "Number of entries in callwheel and size of timeout() preallocation");
+    //TODO: rephrase "Size of timeout() preallocation");
 
 #ifdef	RSS
 static int pin_default_swi = 1;
@@ -163,7 +166,11 @@ struct callout_cpu {
 	struct cc_exec 		cc_exec_entity[2];
 	struct callout		*cc_next;
 	struct callout		*cc_callout;
+#ifdef LAWN
+	Lawn         *cc_lawn;
+#else
 	struct callout_list	*cc_callwheel;
+#endif
 	struct callout_tailq	cc_expireq;
 	struct callout_slist	cc_callfree;
 	sbintime_t		cc_firstevent;
@@ -308,6 +315,7 @@ callout_callwheel_init(void *dummy)
 }
 SYSINIT(callwheel_init, SI_SUB_CPU, SI_ORDER_ANY, callout_callwheel_init, NULL);
 
+
 /*
  * Initialize the per-cpu callout structures.
  */
@@ -320,10 +328,17 @@ callout_cpu_init(struct callout_cpu *cc, int cpu)
 	mtx_init(&cc->cc_lock, "callout", NULL, MTX_SPIN | MTX_RECURSE);
 	SLIST_INIT(&cc->cc_callfree);
 	cc->cc_inited = 1;
+#ifndef LAWN // TODO: remove n from ifndef
+    cc->cc_lawn = (Lawn*)malloc(sizeof(Lawn), M_CALLOUT, M_WAITOK);
+    cc->cc_lawn->timeout_queues = NewTrieMap(); // TODO: init trymap / hashmap
+    cc->cc_lawn->element_nodes = NewTrieMap();
+    cc->cc_lawn->next_expiration = 0;	
+#else
 	cc->cc_callwheel = malloc(sizeof(struct callout_list) * callwheelsize,
 	    M_CALLOUT, M_WAITOK);
 	for (i = 0; i < callwheelsize; i++)
 		LIST_INIT(&cc->cc_callwheel[i]);
+#endif
 	TAILQ_INIT(&cc->cc_expireq);
 	cc->cc_firstevent = SBT_MAX;
 	for (i = 0; i < 2; i++)
@@ -448,6 +463,12 @@ callout_process(sbintime_t now)
 #endif
 
 	cc = CC_SELF();
+#ifndef LAWN // TODO: remove n from ifndef		
+	if (now < cc->cc_lawn->next_expiration){
+		return;
+	}
+#endif
+
 	mtx_lock_spin_flags(&cc->cc_lock, MTX_QUIET);
 
 	/* Compute the buckets of the last scan and present times. */
@@ -481,8 +502,38 @@ callout_process(sbintime_t now)
 
 	/* Iterate callwheel from firstb to nowb and then up to lastb. */
 	do {
+		// get elments to pop
+#ifndef LAWN // TODO: remove n from ifndef		
+		// sc = &cc->cc_lawn[firstb & callwheelmask];
+    	TrieMapIterator * itr = TrieMap_Iterate(lawn->timeout_queues, "", 0);
+    	char* queue_name;
+    	tm_len_t len;
+    	void* queue_pointer;
+    
+    
+    	while (TrieMapIterator_Next(itr, &queue_name, &len, &queue_pointer)) {
+        	ElementQueue* queue = (ElementQueue*)
+			sc = queue_pointer;
+
+
+        while (queue != NULL && queue->len > 0 && queue->head != NULL) {
+            if (queue->head->expiration <= now){
+				// TODO: pop out callout
+            }else{
+                if ((lawn->next_expiration == 0) || 
+                    (queue->head->expiration < lawn->next_expiration))
+                    lawn->next_expiration = queue->head->expiration;
+                break;
+            }
+        }
+    }
+    TrieMapIterator_Free(itr);
+    return retval;		
+	tmp = LIST_FIRST(sc);
+#else
 		sc = &cc->cc_callwheel[firstb & callwheelmask];
 		tmp = LIST_FIRST(sc);
+#endif
 		while (tmp != NULL) {
 			/* Run the callout if present time within allowed. */
 			if (tmp->c_time <= now) {
@@ -585,6 +636,7 @@ callout_lock(struct callout *c)
 	return (cc);
 }
 
+// TODO: add new timer
 static void
 callout_cc_add(struct callout *c, struct callout_cpu *cc,
     sbintime_t sbt, sbintime_t precision, void (*func)(void *),
